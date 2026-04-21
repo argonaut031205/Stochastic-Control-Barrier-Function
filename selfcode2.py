@@ -1,0 +1,984 @@
+"""
+Risk-Bounded Lane-Change Controller  ── CORRECTED VERSION
+==========================================================
+Based on: "Risk-Bounded Control Using Stochastic Barrier Functions"
+          Yaghoubi et al., IEEE Control Systems Letters, 2021
+And:      "Full Derivation of Stochastic Control Barrier Function (SCBF)
+          Constraints" (companion derivation document)
+
+Corrections over selfcode2.py
+------------------------------
+BUG 1 – sigma_acc wrong scaling
+    OLD:  sigma = 0.5 * slope² * B * (dh/dxo @ go)²
+    FIX:  sigma = 0.5 * γ² * cᵢ² * B
+          The stochastic correction involves γ (the barrier exponential gain),
+          not the road slope.  See derivation doc §6.4 and paper Def 4.
+
+BUG 2 – sigma_target wrong scaling (both terms)
+    OLD:  term1 uses slope², term2 uses slope
+    FIX:  term1 = (1/2)*γ²*B*(dh_dxo @ go)²
+          term2 = (1/2)*γ*B*dot(d2h_diag, go²)
+          (derivation doc §8.2, signs: σ = c²/2*(γ²B(p²+q²) – γB(2/Bx²+2/By²)))
+
+BUG 3 – SCBF QP constraint missing −γB scaling on Lie derivatives
+    Def 5 (paper): ∂B/∂x · F_cl + σ ≤ −aB + b
+    ∂B/∂xr = −γB · ∂h/∂xr  ⟹  Lie derivative of B = −γB · LfH  (not LfH)
+    OLD constraint row: [LgH, −1] z ≤ −LfH − σ − aB   ← WRONG
+    FIX constraint row: [γB·LgH, −1] z ≤ γB·LfH + σ − aB  (rearranged below)
+    Correct inequality (move u terms left, rest right):
+        −γB·LgH·u − b ≤ γB·LfH + σ − aB + ... wait, sign convention:
+        −γB(LfH + LgH·u) + σ ≤ −aB + b
+        →  −γB·LgH·u − b ≤ γB·LfH − σ − aB   ... solving for standard form
+
+BUG 4 – Lie derivative of B w.r.t. xo dynamics omitted (ACC barrier)
+    B depends on h = Xo − X − …, so ∂B/∂Xo = −γB.
+    The xo process has drift fo = [vc, γ_slope·vc]ᵀ.
+    ∂B/∂Xo · fo[0] = −γB · vc  must be included in LfB.
+    The code computes only the xr part of LfH; the xo contribution
+    (−γB · vc for ACC; −γB·p·vc + (−γB·q·γ_slope·vc) for target) was missing.
+
+BUG 5 – compute_b_max: negative b_max when B0 ≥ p_bar (already risky)
+    When B0 is large (vehicle near obstacle) the log formula gives b_max < 0.
+    Combining with b ≥ 0 makes the QP infeasible.
+    FIX: clamp b_max to [0, a_scbf] so the QP stays feasible;
+         the risk bound is then best-effort for that timestep.
+
+BUG 6 – QP sign for SCBF rows had double-negation error
+    After computing rhs = −LfH − σ − aB the code appended b_list(−rhs)
+    which is +LfH + σ + aB, reversing the inequality direction.
+
+State / control convention
+--------------------------
+  xr = [X, Y, v, ψ]      (ego, deterministic; kinematic bicycle)
+  xo = [Xo, Yo]           (each obstacle, stochastic)
+  u  = [a, β]             (acceleration, slip angle ≈ steering proxy)
+  QP decision vector: z = [a, β, δ_v, δ_y, b_acc, b_lane]
+"""
+
+import gymnasium as gym
+import highway_env           # noqa: F401  (registers envs)
+import numpy as np
+from qpsolvers import solve_qp
+from scipy.sparse import csc_matrix
+import matplotlib.pyplot as plt
+import pygame
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Colours
+# ─────────────────────────────────────────────────────────────────────────────
+COLOR_DEFAULT = (160, 160, 160)
+COLOR_TARGET  = (255,   0,   0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────────────────────────────────────
+params = {
+    # Environment geometry
+    "v_d":          25.0,
+    "lane_width":    4.0,
+    "N_lanes":       3,
+    "l_r":           5.0,       # bicycle rear-axle offset
+    "y_min":         0.0,
+    "y_max":        14.0,
+
+    # CLF decay rates
+    "clf_rate_v":    0.70,
+    "clf_rate_y":    0.15,
+
+    # Deterministic CBF gain (lane-boundary only — no stochastic noise on walls)
+    "cbf_k":         2.0,
+    "cbf_k_acc":     3.0,
+    "cbf_k_lane":   10.0,
+
+    # Input limits
+    "a_max":         2.5,
+    "a_min":        -4.0,
+    "beta_max":      0.5,
+    "beta_min":     -0.5,
+
+    # QP cost weights
+    "w_a":           0.10,
+    "w_beta":     2000.0,
+    "w_delta_v":  5000.0,
+    "w_delta_y":     1.0,
+    "w_b":         100.0,   # penalise b — drives b small → tighter risk
+
+    # Physics / timing
+    "T":             0.1,   # finite-time planning horizon [s] for risk bound
+    "v0":           15.0,   # reference speed for ACC formula
+    "cd":            0.35,
+    "g":             9.81,
+
+    # Ellipse half-axes for target-vehicle SCBF
+    "Bx":            7.0,
+    "By":            4.0,
+
+    # Barrier exponential gain  B(x) = exp(−γ h(x))
+    "gamma":         5.0,
+
+    # Obstacle noise intensity (paper: cᵢ in Eq. 24)
+    "c_i":           0.1,
+
+    # SCBF parameters (Theorem 2, condition 14)
+    "a_scbf":        1.0,   # fixed a > 0; paper fixes a and solves for b
+    "p_bar":         1e-8,   # desired probability-of-failure upper bound
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lane geometry helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def lane_center_from_index(k, p=params):
+    return k * p["lane_width"] + p["lane_width"] / 2 - 2
+
+def lane_index_from_y(y, p=params):
+    idx = int(np.round(y / p["lane_width"]))
+    return int(np.clip(idx, 0, p["N_lanes"] - 1))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ego (deterministic) dynamics  xr = [X, Y, v, ψ]   u = [a, β]
+# Kinematic bicycle (derivation doc §1):
+#   ẋr = f(xr) + g(xr) u
+# ─────────────────────────────────────────────────────────────────────────────
+def f_vec(xr):
+    _, _, v, psi = xr
+    return np.array([v * np.cos(psi),
+                     v * np.sin(psi),
+                     0.0,
+                     0.0])
+
+def g_mat(xr):
+    _, _, v, psi = xr
+    return np.array([
+        [0.0, -v * np.sin(psi)],
+        [0.0,  v * np.cos(psi)],
+        [1.0,  0.0            ],
+        [0.0,  v / params["l_r"]],
+    ])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Obstacle stochastic model  dxo = fo dt + go dw
+# Paper Eq. (24):  fo = [vc, γ_slope·vc]ᵀ,  go = cᵢ·[1, γ_slope]ᵀ
+# ─────────────────────────────────────────────────────────────────────────────
+def get_slope(veh):
+    """Lateral/longitudinal velocity ratio (road slope γ_i in the paper)."""
+    vx = veh.speed * np.cos(veh.heading)
+    vy = veh.speed * np.sin(veh.heading)
+    return 0.0 if abs(vx) < 1e-6 else vy / vx
+
+def f_sto(veh):
+    slope = get_slope(veh)
+    return np.array([veh.speed, slope * veh.speed])
+
+def g_sto(veh, c_i=None):
+    """go column vector — shape (2,).  Paper Eq. (24): go = cᵢ·[1, γ_slope]ᵀ"""
+    if c_i is None:
+        c_i = params["c_i"]
+    return c_i * np.array([1.0, get_slope(veh)])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Barrier function  B(x) = exp(−γ h(x))
+# ─────────────────────────────────────────────────────────────────────────────
+def barrier_value(h, gamma=None):
+    if gamma is None:
+        gamma = params["gamma"]
+    return float(np.exp(-gamma * h))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stochastic correction  σ = (1/2) tr( goᵀ · ∂²B/∂xo² · go )
+#
+# For B = exp(−γ h):
+#   ∂B/∂xo   = −γ B (∂h/∂xo)
+#   ∂²B/∂xo² = γ² B (∂h/∂xo)(∂h/∂xo)ᵀ − γ B (∂²h/∂xo²)
+#
+# Therefore:
+#   σ = (1/2) goᵀ [γ²B (∂h/∂xo)(∂h/∂xo)ᵀ − γB ∂²h/∂xo²] go
+#     = (B/2) [γ²(∂h/∂xo · go)² − γ goᵀ diag(∂²h/∂xo²) go]
+#
+# ─── ACC barrier  h = Xo − X − Tv − (v0−v)²/(2cd g) − 5 ─────────────────
+#   ∂h/∂xo = [1, 0],  ∂²h/∂xo² = 0
+#   σ_acc  = (B/2) · γ² · (go[0])² = (B/2) · γ² · cᵢ²
+#   (derivation doc §6.4)
+#
+# ─── Target-ellipse barrier  h = (xi−X)²/Bx² + (yi−Y)²/By² − 1 ──────────
+#   ∂h/∂xo = [+2(xi−X)/Bx², +2(yi−Y)/By²]  (xo IS the obstacle position)
+#   ∂²h/∂xo² = diag(2/Bx², 2/By²)
+#   σ_target = (B/2)[γ²(dh·go)² − γ dot(d2h_diag, go²)]
+#   (derivation doc §8.2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sigma_acc(h_val, veh, p=params):
+    """
+    FIX (Bug 1): use γ² (barrier gain), NOT slope².
+    σ_acc = (1/2) · γ² · cᵢ² · B
+    """
+    B     = barrier_value(h_val, p["gamma"])
+    gamma = p["gamma"]
+    c_i   = p["c_i"]
+    # go[0] = cᵢ · 1  (X component);  ∂h/∂xo=[1,0]  ⟹  (dh·go)² = cᵢ²
+    return 0.5 * gamma**2 * c_i**2 * B
+
+
+def sigma_target(h_val, xi, yi, xr, veh, p=params):
+    """
+    FIX (Bug 2): use γ² and γ (barrier gain), NOT slope² and slope.
+    σ_target = (B/2)[γ²(dh·go)² − γ·dot(d2h_diag, go²)]
+    where  p̃ = −2(xi−X)/Bx²,  q̃ = −2(yi−Y)/By²  (derivation doc §8)
+    """
+    X, Y  = xr[0], xr[1]
+    B     = barrier_value(h_val, p["gamma"])
+    go    = g_sto(veh, p["c_i"])   # shape (2,)
+    gamma = p["gamma"]
+    Bx, By = p["Bx"], p["By"]
+    dx, dy  = xi - X, yi - Y
+
+    dh_dxo   = np.array([2.0 * dx / Bx**2, 2.0 * dy / By**2])
+    d2h_diag = np.array([2.0 / Bx**2,      2.0 / By**2])
+
+    term1 = gamma**2 * (dh_dxo @ go)**2          # FIX: γ² not slope²
+    term2 = gamma    * np.dot(d2h_diag, go**2)    # FIX: γ  not slope
+    return 0.5 * B * (term1 - term2)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Risk-bound on b  (Theorem 2, condition 14)
+#
+#   b ≤ min( a,  −(1/T) ln((1 − p̄)/(1 − B0)) )
+#
+# Clamped to [0, a_scbf] to prevent infeasibility when the vehicle is already
+# in or near the unsafe set (B0 large → log argument < 1 → b_max < 0).
+# In that case the QP is best-effort; a backup controller should take over.
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_b_max(B0, p=params):
+    """
+    FIX (Bug 5): clamp b_max to [0, a_scbf].
+    """
+    a    = p["a_scbf"]
+    T    = p["T"]
+    pbar = p["p_bar"]
+    ratio = (1.0 - pbar) / max(1.0 - B0, 1e-9)
+    if ratio <= 0.0:
+        return float(a)                          # already violated; keep feasible
+    b_cond = -(1.0 / T) * np.log(ratio)
+    return float(np.clip(min(a, b_cond), 0.0, a))   # FIX: clamp ≥ 0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLFs
+# ─────────────────────────────────────────────────────────────────────────────
+def clf_v(xr):
+    return (xr[2] - params["v_d"]) ** 2
+
+def clf_y(xr, y_t):
+    return (xr[1] - y_t) ** 2
+
+def lie_clf_v(xr):
+    dV = np.array([0.0, 0.0, 2.0 * (xr[2] - params["v_d"]), 0.0])
+    return clf_v(xr), dV @ f_vec(xr), dV @ g_mat(xr)
+
+def lie_clf_y(xr, y_t):
+    dV = np.array([0.0, 2.0 * (xr[1] - y_t), 0.0, 0.0])
+    return clf_y(xr, y_t), dV @ f_vec(xr), dV @ g_mat(xr)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lane-boundary CBF  (deterministic; no stochastic correction needed)
+# ─────────────────────────────────────────────────────────────────────────────
+def cbf_boundary(xr):
+    y = xr[1]
+    return -np.log(
+        np.exp(-(y - params["y_min"])) +
+        np.exp(-(params["y_max"] - y))
+    )
+
+def lie_cbf_boundary(xr):
+    y  = xr[1]
+    e1 = np.exp(-(y - params["y_min"]))
+    e2 = np.exp(-(params["y_max"] - y))
+    dhdy = (e1 - e2) / (e1 + e2)
+    grad = np.array([0.0, dhdy, 0.0, 0.0])
+    return cbf_boundary(xr), grad @ f_vec(xr), grad @ g_mat(xr)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCBF Lie-derivative helper
+#
+# For B = exp(−γ h) the SCBF condition (Def 5 / paper Eq. 12) is:
+#
+#   ∂B/∂xr·(f+g u) + ∂B/∂xo·fo + σ  ≤  −aB + b
+#
+# ∂B/∂xr = −γB·∂h/∂xr,  ∂B/∂xo = −γB·∂h/∂xo
+#
+# Define (for the xo-augmented Lie derivative):
+#   LfB_full = −γB·( LfH_xr  +  (∂h/∂xo)·fo )
+#            = −γB·( LfH_xr  +  LfH_xo )
+#   LgB      = −γB·LgH_xr
+#
+# The QP constraint becomes:
+#   LgB·u − b  ≤  −LfB_full − σ − aB
+#   −γB·LgH·u − b  ≤  γB·(LfH_xr + LfH_xo) − σ − aB
+#
+# In standard form  [row]·z ≤ rhs:
+#   row = [γB·LgH[0],  γB·LgH[1],  0, 0, ..., −1, ...]
+#   rhs =  γB·(LfH_xr + LfH_xo) − σ − aB
+#
+# (Signs: we want  LgB·u − b ≤ rhs_raw,
+#         i.e.  −γB·LgH·u − b ≤ rhs_raw
+#         i.e.  [γB·LgH, −1]·z ≤ −rhs_raw  ... careful below)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scbf_row_rhs(LfH_xr, LfH_xo, LgH_xr, sigma, B0, a_scbf, gamma):
+    """
+    Returns (A_row_scaled, rhs) for the SCBF inequality:
+        [γB·LgH_xr | −1] z  ≤  γB·(LfH_xr + LfH_xo) − σ + aB  ... wait
+
+    Derivation (FIX Bug 3 & 6):
+        ∂B/∂x·F_cl + σ ≤ −aB + b
+        −γB(LfH_xr + LfH_xo)  −  γB·LgH_xr·u  +  σ  ≤  −aB + b
+        −γB·LgH_xr·u  −  b  ≤  γB(LfH_xr + LfH_xo)  −  σ  +  aB  ... (*)
+
+    Standard QP form:  A·z ≤ rhs  where z contains u and b:
+        row for u-part  :  γB·LgH_xr   (positive)
+        coeff of −b     :  −1
+        rhs             :  γB·(LfH_xr + LfH_xo) − σ + aB
+
+    Wait — (*) has the negatives on the left, let's be explicit.
+    Let ℓ = LfH_xr + LfH_xo.  The inequality (*) says:
+        −γB·LgH[0]·a  −  γB·LgH[1]·β  −  b  ≤  γB·ℓ − σ + aB
+    Row coefficients for [a, β, ..., b_slot, ...] in z:
+        [−γB·LgH[0], −γB·LgH[1],  0, 0, ...,  −1,  ...]
+    rhs = γB·ℓ − σ + aB
+    """
+    gB     = gamma * B0
+    ell    = LfH_xr + LfH_xo
+    # A-row entries for u = [a, β]:
+    A_u    = -gB * LgH_xr          # shape (2,)
+    rhs    =  gB * ell - sigma + a_scbf * B0
+    return A_u, rhs                 # caller places −1 for the b slot
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACC SCBF  (derivation doc §6)
+#
+# h_acc = (Xo − X) − T·v − (v0−v)²/(2 cd g) − 5
+#
+# ∂h/∂xr:  [−1, 0, dh_dv, 0]  where dh_dv = −T + (v0−v)/(cd·g)
+#           (here v0 = lead_vehicle.speed, the leading car's speed)
+# ∂h/∂xo:  [1, 0]    (Xo appears with +1)
+#
+# LfH_xr = grad_xr · f(xr)  =  −v·cos(ψ) + dh_dv·0  (f = [v cosψ, v sinψ, 0, 0])
+# LfH_xo = (∂h/∂xo) · fo   =  1·vc  (fo = [vc, slope·vc], first component)
+# LgH_xr = grad_xr · g(xr)  (2-vector)
+# ─────────────────────────────────────────────────────────────────────────────
+def cbf_acc(xr, lead_veh, p=params):
+    X, _, v, _ = xr
+    Xo  = lead_veh.position[0]
+    v0  = lead_veh.speed                    # leading car speed (acts as v0)
+    cdg = p["cd"] * p["g"]
+
+    h        = Xo - X - p["T"] * v - 0.5 * (v0 - v)**2 / cdg - 5.0
+    dh_dv    = -p["T"] + (v0 - v) / cdg
+    grad_xr  = np.array([-1.0, 0.0, dh_dv, 0.0])
+
+    LfH_xr  = grad_xr @ f_vec(xr)
+    LgH_xr  = grad_xr @ g_mat(xr)         # shape (2,)
+
+    # FIX Bug 4: include xo drift contribution
+    vc       = lead_veh.speed              # paper: vc,i
+    LfH_xo  = 1.0 * vc                    # (∂h/∂Xo)·vc = 1·vc
+
+    sig = sigma_acc(h, lead_veh, p)
+    return h, LfH_xr, LfH_xo, LgH_xr, sig
+
+
+def cbf_target(xr, xi, yi, veh, p=params):
+    """
+    Target-ellipse SCBF  (derivation doc §8)
+
+    h = (xi−X)²/Bx² + (yi−Y)²/By² − 1
+
+    ∂h/∂xr = [−2(xi−X)/Bx², −2(yi−Y)/By², 0, 0]
+    ∂h/∂xo = [+2(xi−X)/Bx², +2(yi−Y)/By²]   (xo is the obstacle position)
+    LfH_xo = (∂h/∂xo) · fo_obs
+    """
+    X, Y, _, _ = xr
+    dx = xi - X;  dy = yi - Y
+    Bx, By = p["Bx"], p["By"]
+
+    h       = dx**2 / Bx**2 + dy**2 / By**2 - 1.0
+    grad_xr = np.array([-2.0*dx/Bx**2, -2.0*dy/By**2, 0.0, 0.0])
+    LfH_xr  = grad_xr @ f_vec(xr)
+    LgH_xr  = grad_xr @ g_mat(xr)         # shape (2,)
+
+    # FIX Bug 4: include xo drift for target
+    dh_dxo = np.array([2.0*dx/Bx**2, 2.0*dy/By**2])
+    fo_obs = f_sto(veh)                    # [vc, slope·vc]
+    LfH_xo = float(dh_dxo @ fo_obs)
+
+    sig = sigma_target(h, xi, yi, xr, veh, p)
+    return h, LfH_xr, LfH_xo, LgH_xr, sig
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vehicle finders
+# ─────────────────────────────────────────────────────────────────────────────
+def find_lead_vehicle(ego, vehicles):
+    ego_lane = lane_index_from_y(ego.position[1])
+    lead = None
+    for veh in vehicles:
+        if veh is ego:
+            continue
+        if (lane_index_from_y(veh.position[1]) == ego_lane
+                and veh.position[0] > ego.position[0]):
+            if lead is None or veh.position[0] < lead.position[0]:
+                lead = veh
+            
+    return lead
+
+def find_target_vehicle(ego, target_lane, vehicles):
+    closest  = None
+    min_dist = np.inf
+    for veh in vehicles:
+        if veh is ego:
+            continue
+        if lane_index_from_y(veh.position[1]) != target_lane:
+            continue
+        dist = np.hypot(veh.position[0] - ego.position[0],
+                        veh.position[1] - ego.position[1])
+        if dist < min_dist:
+            min_dist = dist
+            closest  = veh
+    return closest
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QP builder
+#
+# Decision vector  z = [a, β, δ_v, δ_y, b_acc, b_lane]
+#                       0   1    2    3      4       5
+#
+# SCBF constraint (FIX Bugs 3, 4, 6) — see _scbf_row_rhs():
+#   row = [−γB·LgH[0], −γB·LgH[1], 0, 0, [−1 or 0], [0 or −1]]
+#   rhs =  γB·(LfH_xr + LfH_xo) − σ + a·B
+# ─────────────────────────────────────────────────────────────────────────────
+def build_qp(xr, u_ref, y_t,
+             clf_alpha, clf_beta,
+             lead_vehicle, target_vehicle, xi, yi,
+             steering_unlock, p=params):
+    """
+    Returns (P, q, A_ub, b_ub, diag) for
+        min  ½ zᵀPz + qᵀz    s.t.  A_ub z ≤ b_ub
+    """
+    a_scbf = p["a_scbf"]
+    gamma  = p["gamma"]
+
+    # ── CLF terms ──────────────────────────────────────────────────────────
+    Vv, LfVv, LgVv = lie_clf_v(xr)
+    Vy, LfVy, LgVy = lie_clf_y(xr, y_t)
+
+    # ── Boundary CBF (deterministic) ────────────────────────────────────────
+    hB, LfHB, LgHB = lie_cbf_boundary(xr)
+
+    # ── ACC SCBF ─────────────────────────────────────────────────────────────
+    use_acc   = False
+    h_acc     = np.inf
+    LfH_acc_xr = 0.0;  LfH_acc_xo = 0.0
+    LgH_acc   = np.zeros(2)
+    sig_acc   = 0.0
+    b_max_acc = a_scbf
+    B0_acc    = 0.0
+
+    if lead_vehicle is not None:
+        h_acc, LfH_acc_xr, LfH_acc_xo, LgH_acc, sig_acc = cbf_acc(xr, lead_vehicle, p)
+        if not np.isinf(h_acc):
+            B0_acc    = barrier_value(h_acc, gamma)
+            b_max_acc = compute_b_max(B0_acc, p)
+            use_acc   = True
+
+    # ── Target-ellipse SCBF ──────────────────────────────────────────────────
+    use_lane   = False
+    h_lane     = np.inf
+    LfH_lane_xr = 0.0;  LfH_lane_xo = 0.0
+    LgH_lane   = np.zeros(2)
+    sig_lane   = 0.0
+    b_max_lane = a_scbf
+    B0_lane    = 0.0
+
+    if steering_unlock and target_vehicle is not None:
+        h_lane, LfH_lane_xr, LfH_lane_xo, LgH_lane, sig_lane = cbf_target(
+            xr, xi, yi, target_vehicle, p)
+        if not np.isinf(h_lane):
+            B0_lane    = barrier_value(h_lane, gamma)
+            b_max_lane = compute_b_max(B0_lane, p)
+            use_lane   = True
+
+    # ── Cost matrix P (diagonal, factor-2 absorbed) ──────────────────────────
+    P = np.diag([
+        2 * p["w_a"],
+        2 * p["w_beta"],
+        2 * p["w_delta_v"],
+        2 * p["w_delta_y"],
+        2 * p["w_b"],       # penalise b_acc
+        2 * p["w_b"],       # penalise b_lane
+    ])
+
+    # ── Cost vector q ────────────────────────────────────────────────────────
+    q = np.array([
+        -2 * p["w_a"]    * u_ref[0],
+        -2 * p["w_beta"] * u_ref[1],
+        0.0, 0.0, 0.0, 0.0,
+    ])
+
+    A_list, b_list = [], []
+
+    # ── CLF speed:  LgVv·u − δ_v ≤ −LfVv − rate·Vv ─────────────────────────
+    A_list.append([LgVv[0], LgVv[1], -1.0, 0.0, 0.0, 0.0])
+    b_list.append(-LfVv - clf_beta * p["clf_rate_v"] * Vv)
+
+    # ── CLF lateral: LgVy·u − δ_y ≤ −LfVy − rate·Vy ─────────────────────────
+    A_list.append([LgVy[0], LgVy[1], 0.0, -1.0, 0.0, 0.0])
+    b_list.append(-LfVy - clf_alpha * p["clf_rate_y"] * Vy)
+
+    # ── Boundary CBF (deterministic): −LgHB·u ≤ LfHB + k·hB ────────────────
+    A_list.append([-LgHB[0], -LgHB[1], 0.0, 0.0, 0.0, 0.0])
+    b_list.append(LfHB + p["cbf_k"] * hB)
+
+    # ── ACC SCBF  (FIX Bugs 3, 4, 6) ────────────────────────────────────────
+    # Constraint: −γB·LgH·u − b_acc ≤ γB·(LfH_xr+LfH_xo) − σ + a·B
+    if use_acc:
+        A_u, rhs = _scbf_row_rhs(
+            LfH_acc_xr, LfH_acc_xo, LgH_acc, sig_acc, B0_acc, a_scbf, gamma)
+        # row: [A_u[0], A_u[1], 0, 0, −1, 0]   (−1 for b_acc at index 4)
+        A_list.append([A_u[0], A_u[1], 0.0, 0.0, -1.0, 0.0])
+        b_list.append(rhs)
+
+    # ── Target-ellipse SCBF  (FIX Bugs 3, 4, 6) ─────────────────────────────
+    if use_lane:
+        A_u, rhs = _scbf_row_rhs(
+            LfH_lane_xr, LfH_lane_xo, LgH_lane, sig_lane, B0_lane, a_scbf, gamma)
+        A_list.append([A_u[0], A_u[1], 0.0, 0.0, 0.0, -1.0])
+        b_list.append(rhs)
+
+    # ── Risk bounds on b (Theorem 2, condition 14) ───────────────────────────
+    #   b_acc ≤ b_max_acc      [0,0,0,0, 1,0] z ≤ b_max_acc
+    #   b_acc ≥ 0              [0,0,0,0,−1,0] z ≤ 0
+    A_list.append([0.0, 0.0, 0.0, 0.0,  1.0, 0.0]); b_list.append(b_max_acc)
+    A_list.append([0.0, 0.0, 0.0, 0.0, -1.0, 0.0]); b_list.append(0.0)
+
+    A_list.append([0.0, 0.0, 0.0, 0.0, 0.0,  1.0]); b_list.append(b_max_lane)
+    A_list.append([0.0, 0.0, 0.0, 0.0, 0.0, -1.0]); b_list.append(0.0)
+
+    # ── Input limits ─────────────────────────────────────────────────────────
+    A_list.append([ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]); b_list.append( p["a_max"])
+    A_list.append([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0]); b_list.append(-p["a_min"])
+    A_list.append([0.0,  1.0, 0.0, 0.0, 0.0, 0.0]); b_list.append( p["beta_max"])
+    A_list.append([0.0, -1.0, 0.0, 0.0, 0.0, 0.0]); b_list.append(-p["beta_min"])
+
+    A_np = np.array(A_list, dtype=float)
+    b_np = np.array(b_list, dtype=float)
+
+    diag = {
+        "Vv": Vv, "Vy": Vy, "hB": hB,
+        "h_acc":    h_acc,    "LfH_acc":  LfH_acc_xr + LfH_acc_xo,
+        "LgH_acc":  LgH_acc,  "sig_acc":  sig_acc,    "B0_acc":  B0_acc,
+        "h_lane":   h_lane,   "LfH_lane": LfH_lane_xr + LfH_lane_xo,
+        "LgH_lane": LgH_lane, "sig_lane": sig_lane,   "B0_lane": B0_lane,
+        "LfHB": LfHB, "LgHB": LgHB,
+        "b_max_acc": b_max_acc, "b_max_lane": b_max_lane,
+    }
+    return csc_matrix(P), q, csc_matrix(A_np), b_np, diag
+
+
+def build_qp_fallback(xr, u_ref, y_t, clf_alpha, clf_beta,
+                      lead_vehicle, p=params):
+    """
+    Fallback QP: drops the target-ellipse constraint.
+    z = [a, β, δ_v, δ_y, b_acc]   (5-vector)
+    """
+    a_scbf = p["a_scbf"]
+    gamma  = p["gamma"]
+
+    Vv, LfVv, LgVv = lie_clf_v(xr)
+    Vy, LfVy, LgVy = lie_clf_y(xr, y_t)
+    hB, LfHB, LgHB = lie_cbf_boundary(xr)
+
+    use_acc   = False
+    h_acc     = np.inf
+    LfH_acc_xr = 0.0;  LfH_acc_xo = 0.0
+    LgH_acc   = np.zeros(2)
+    sig_acc   = 0.0
+    b_max_acc = a_scbf
+    B0_acc    = 0.0
+
+    if lead_vehicle is not None:
+        h_acc, LfH_acc_xr, LfH_acc_xo, LgH_acc, sig_acc = cbf_acc(xr, lead_vehicle, p)
+        if not np.isinf(h_acc):
+            B0_acc    = barrier_value(h_acc, gamma)
+            b_max_acc = compute_b_max(B0_acc, p)
+            use_acc   = True
+
+    P = np.diag([2*p["w_a"], 2*p["w_beta"], 2*p["w_delta_v"], 2*p["w_delta_y"], 2*p["w_b"]])
+    q = np.array([-2*p["w_a"]*u_ref[0], -2*p["w_beta"]*u_ref[1], 0.0, 0.0, 0.0])
+
+    A_list, b_list = [], []
+
+    A_list.append([LgVv[0], LgVv[1], -1.0, 0.0, 0.0])
+    b_list.append(-LfVv - clf_beta * p["clf_rate_v"] * Vv)
+
+    A_list.append([LgVy[0], LgVy[1], 0.0, -1.0, 0.0])
+    b_list.append(-LfVy - clf_alpha * p["clf_rate_y"] * Vy)
+
+    A_list.append([-LgHB[0], -LgHB[1], 0.0, 0.0, 0.0])
+    b_list.append(LfHB + p["cbf_k"] * hB)
+
+    if use_acc:
+        A_u, rhs = _scbf_row_rhs(
+            LfH_acc_xr, LfH_acc_xo, LgH_acc, sig_acc, B0_acc, a_scbf, gamma)
+        A_list.append([A_u[0], A_u[1], 0.0, 0.0, -1.0])
+        b_list.append(rhs)
+
+    A_list.append([0.0, 0.0, 0.0, 0.0,  1.0]); b_list.append(b_max_acc)
+    A_list.append([0.0, 0.0, 0.0, 0.0, -1.0]); b_list.append(0.0)
+
+    A_list.append([ 1.0, 0.0, 0.0, 0.0, 0.0]); b_list.append( p["a_max"])
+    A_list.append([-1.0, 0.0, 0.0, 0.0, 0.0]); b_list.append(-p["a_min"])
+    A_list.append([0.0,  1.0, 0.0, 0.0, 0.0]); b_list.append( p["beta_max"])
+    A_list.append([0.0, -1.0, 0.0, 0.0, 0.0]); b_list.append(-p["beta_min"])
+
+    diag = {
+        "Vv": Vv, "Vy": Vy, "hB": hB,
+        "h_acc":    h_acc,    "LfH_acc":  LfH_acc_xr + LfH_acc_xo,
+        "LgH_acc":  LgH_acc,  "sig_acc":  sig_acc,   "B0_acc":  B0_acc,
+        "h_lane":   np.nan,   "LfH_lane": np.nan,
+        "LgH_lane": np.zeros(2), "sig_lane": np.nan, "B0_lane": np.nan,
+        "LfHB": LfHB, "LgHB": LgHB,
+        "b_max_acc": b_max_acc, "b_max_lane": np.nan,
+    }
+    return (csc_matrix(P), q,
+            csc_matrix(np.array(A_list, dtype=float)),
+            np.array(b_list, dtype=float), diag)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Controller: solve QP with fallback chain
+# ─────────────────────────────────────────────────────────────────────────────
+def ctrl_qp(xr, u_ref, y_t, clf_alpha, clf_beta,
+            lead_vehicle, target_vehicle, xi, yi,
+            steering_unlock, p=params):
+
+    diag = None
+
+    # Attempt 1: full SCBF QP (6 decision variables)
+    try:
+        P, q, A, b, diag = build_qp(
+            xr, u_ref, y_t, clf_alpha, clf_beta,
+            lead_vehicle, target_vehicle, xi, yi,
+            steering_unlock, p)
+        sol = solve_qp(P, q, A, b, solver="osqp")
+        if sol is not None:
+            return sol, diag
+    except Exception as e:
+        print(f"[QP1 failed] {e}")
+
+    # Attempt 2: fallback without target-ellipse constraint (5 variables)
+    try:
+        P2, q2, A2, b2, diag = build_qp_fallback(
+            xr, u_ref, y_t, clf_alpha, clf_beta,
+            lead_vehicle, p)
+        sol = solve_qp(P2, q2, A2, b2, solver="osqp")
+        if sol is not None:
+            padded = np.zeros(6)
+            padded[:5] = sol
+            return padded, diag
+    except Exception as e:
+        print(f"[QP2 failed] {e}")
+
+    # Attempt 3: zero control
+    print("[WARN] Both QPs failed — zero control.")
+    if diag is None:
+        Vv, _, _ = lie_clf_v(xr)
+        Vy, _, _ = lie_clf_y(xr, y_t)
+        hB, LfHB, LgHB = lie_cbf_boundary(xr)
+        diag = {
+            "Vv": Vv, "Vy": Vy, "hB": hB,
+            "h_acc": np.inf, "LfH_acc": 0.0, "LgH_acc": np.zeros(2),
+            "sig_acc": 0.0,  "B0_acc": 0.0,
+            "h_lane": np.nan, "LfH_lane": np.nan,
+            "LgH_lane": np.zeros(2), "sig_lane": np.nan, "B0_lane": np.nan,
+            "LfHB": LfHB, "LgHB": LgHB,
+            "b_max_acc": 0.0, "b_max_lane": np.nan,
+        }
+    return np.zeros(6), diag
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pygame / Gym setup
+# ─────────────────────────────────────────────────────────────────────────────
+pygame.init()
+screen = pygame.display.set_mode((300, 100))
+pygame.display.set_caption("SCBF Lane Control — Corrected")
+
+pygame.joystick.init()
+joystick = None
+if pygame.joystick.get_count() > 0:
+    joystick = pygame.joystick.Joystick(0)
+    joystick.init()
+    print("Joystick:", joystick.get_name())
+
+env = gym.make("highway-v0", render_mode="human")
+env = env.unwrapped
+env.configure({
+    "lanes_count":          params["N_lanes"],
+    "vehicles_count":       50,
+    "duration":             200,
+    "simulation_frequency": 30,
+    "policy_frequency":     30,
+    "action":               {"type": "ContinuousAction"},
+    "vehicles_density":     1.3,
+})
+obs, _ = env.reset()
+ego    = env.vehicle
+
+dt    = 1.0 / env.config["policy_frequency"]
+steps = int(env.config["duration"] * env.config["policy_frequency"])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logs = {k: [] for k in [
+    "t", "x", "y", "v", "psi", "a", "beta",
+    "Vv", "Vy", "hB", "LfHB", "LgHuB", "marginB",
+    "h_acc", "LfH_acc", "LgHu_acc", "margin_acc", "sig_acc",
+    "psi_dot", "beta_sat", "y_dot",
+    "z_dist", "lead_present",
+    "h_lane", "LfH_lane", "LgHu_lane", "sig_lane",
+    "b_acc", "b_lane", "b_max_acc", "b_max_lane",
+    "risk_upper_bound",   # pB = 1 − (1−B0)·exp(−b·T)   Eq. (10) paper
+]}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main loop
+# ─────────────────────────────────────────────────────────────────────────────
+beta_ref        = 0.0
+joystick_mode   = 0
+steering_unlock = False
+prev_target_veh = None
+
+for k in range(steps):
+    # ── Event handling ────────────────────────────────────────────────────
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            pygame.quit(); env.close(); exit()
+
+    if joystick is not None:
+        pygame.event.pump()
+        trig_left  = joystick.get_axis(4)
+        trig_right = joystick.get_axis(5)
+        if trig_left  != -1: joystick_mode = 1
+        if trig_right != -1: joystick_mode = 0
+        beta_ref = (joystick.get_axis(0) * params["beta_max"]
+                    if joystick_mode == 1 else 0.0)
+    else:
+        keys = pygame.key.get_pressed()
+        steering_unlock = bool(keys[pygame.K_SPACE])
+        if steering_unlock:
+            if keys[pygame.K_RIGHT]:
+                beta_ref += 0.001
+            elif keys[pygame.K_LEFT]:
+                beta_ref -= 0.001
+            else:
+                beta_ref = 0.0
+
+    beta_ref  = np.clip(beta_ref, params["beta_min"], params["beta_max"])
+    clf_alpha = 0.4 if steering_unlock else 1.0
+    clf_beta  = 0.3 if steering_unlock else 1.0
+
+    # ── Ego state ─────────────────────────────────────────────────────────
+    xr = np.array([ego.position[0], ego.position[1],
+                   ego.speed, ego.heading])
+
+    curr_lane = lane_index_from_y(ego.position[1])
+    y_t       = lane_center_from_index(curr_lane)
+
+    # ── Lead vehicle (ACC) ────────────────────────────────────────────────
+    lead_vehicle = find_lead_vehicle(ego, env.road.vehicles)
+    z_dist       = (lead_vehicle.position[0] - ego.position[0]
+                    if lead_vehicle is not None else np.inf)
+    lead_present = 1.0 if lead_vehicle is not None else 0.0
+
+    # ── Target lane / vehicle ─────────────────────────────────────────────
+    target_lane = curr_lane
+    if steering_unlock:
+        if beta_ref < 0.0 and curr_lane > 0:
+            target_lane = curr_lane - 1
+        elif beta_ref > 0.0 and curr_lane < params["N_lanes"] - 1:
+            target_lane = curr_lane + 1
+
+    target_veh = find_target_vehicle(ego, target_lane, env.road.vehicles)
+
+    # Colour management
+    if prev_target_veh is not None:
+        prev_target_veh.color = COLOR_DEFAULT
+    if target_veh is not None:
+        target_veh.color = COLOR_TARGET
+        prev_target_veh  = target_veh
+    else:
+        prev_target_veh = None
+
+    # Obstacle position (safe dummy if no target)
+    if target_veh is not None:
+        xi, yi = target_veh.position[0], target_veh.position[1]
+    else:
+        xi, yi = ego.position[0], ego.position[1]
+
+    print(f"[k={k}] steer={steering_unlock}  "
+          f"target={'yes' if target_veh else 'no'}  "
+          f"lead={'yes' if lead_vehicle else 'no'}")
+
+    # ── Solve QP ──────────────────────────────────────────────────────────
+    z, diag = ctrl_qp(
+        xr, np.array([0.0, beta_ref]), y_t,
+        clf_alpha, clf_beta,
+        lead_vehicle, target_vehicle=target_veh,
+        xi=xi, yi=yi,
+        steering_unlock=steering_unlock,
+    )
+
+    # ── Step environment ──────────────────────────────────────────────────
+    obs, _, term, trunc, _ = env.step(z[:2])
+    # In your sim loop, after env.step():
+    for veh in env.road.vehicles:
+        if veh is ego: continue
+        dw = np.random.normal(0, np.sqrt(0.01))
+        go = g_sto(veh)
+        veh.position[0] += 5*go[0] * dw
+        veh.position[1] += 5*go[1] * dw
+    # ── Derived quantities for logging ────────────────────────────────────
+    psi_dot  = xr[2] / params["l_r"] * z[1]
+    LgHuB    = diag["LgHB"] @ z[:2]
+    marginB  = diag["LfHB"] + LgHuB + params["cbf_k"] * diag["hB"]
+
+    h_acc_val = diag["h_acc"]
+    if lead_present > 0 and not np.isinf(h_acc_val):
+        LgHu_acc   = diag["LgH_acc"] @ z[:2]
+        margin_acc = diag["LfH_acc"] + LgHu_acc + params["cbf_k_acc"] * h_acc_val
+    else:
+        LgHu_acc = margin_acc = 0.0
+        h_acc_val = 0.0
+
+    # Risk upper bound  pB = 1 − (1−B0)·exp(−b·T)   [Eq. 10 paper]
+    b_acc_sol  = float(z[4]) if len(z) > 4 else 0.0
+    b_lane_sol = float(z[5]) if len(z) > 5 else 0.0
+    B0_risk    = float(diag.get("B0_acc", 0.0))
+    T          = params["T"]
+    risk_ub    = 1.0 - (1.0 - B0_risk) * np.exp(-b_acc_sol * T)
+
+    # ── Logging ───────────────────────────────────────────────────────────
+    logs["t"].append(k * dt)
+    logs["x"].append(xr[0]);          logs["y"].append(xr[1])
+    logs["v"].append(xr[2]);          logs["psi"].append(xr[3])
+    logs["a"].append(z[0]);           logs["beta"].append(z[1])
+    logs["Vv"].append(diag["Vv"]);    logs["Vy"].append(diag["Vy"])
+    logs["hB"].append(diag["hB"])
+    logs["LfHB"].append(diag["LfHB"])
+    logs["LgHuB"].append(LgHuB);      logs["marginB"].append(marginB)
+    logs["h_acc"].append(h_acc_val)
+    logs["LfH_acc"].append(diag["LfH_acc"])
+    logs["LgHu_acc"].append(LgHu_acc)
+    logs["margin_acc"].append(margin_acc)
+    logs["sig_acc"].append(diag["sig_acc"])
+    logs["psi_dot"].append(psi_dot)
+    logs["beta_sat"].append(abs(z[1]) / params["beta_max"])
+    logs["y_dot"].append(xr[2] * np.sin(xr[3]))
+    logs["z_dist"].append(z_dist if z_dist != np.inf else np.nan)
+    logs["lead_present"].append(lead_present)
+    logs["h_lane"].append(diag["h_lane"])
+    logs["LfH_lane"].append(diag["LfH_lane"])
+
+    lg_lane = diag["LgH_lane"]
+    logs["LgHu_lane"].append(
+        float(lg_lane @ z[:2])
+        if not (np.isscalar(lg_lane) and np.isnan(lg_lane))
+        else np.nan)
+
+    logs["sig_lane"].append(diag["sig_lane"])
+    logs["b_acc"].append(b_acc_sol)
+    logs["b_lane"].append(b_lane_sol)
+    logs["b_max_acc"].append(diag["b_max_acc"])
+    logs["b_max_lane"].append(
+        diag["b_max_lane"]
+        if not np.isnan(diag.get("b_max_lane", np.nan))
+        else np.nan)
+    logs["risk_upper_bound"].append(risk_ub)
+
+    if term or trunc:
+        break
+
+env.close()
+pygame.quit()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plots
+# ─────────────────────────────────────────────────────────────────────────────
+t = logs["t"]
+
+def safe(key):
+    return np.array(logs[key], dtype=float)
+
+fig, axs = plt.subplots(5, 2, sharex=True, figsize=(14, 14))
+fig.suptitle("SCBF Highway Controller — Risk-Bounded Lane Change (Corrected)",
+             fontsize=13)
+
+# Row 0: ACC CBF
+axs[0,0].plot(t, safe("h_acc"), lw=2, label="h_acc")
+axs[0,0].axhline(0, ls="--", color="r")
+axs[0,0].set_ylabel("h_acc"); axs[0,0].set_title("ACC CBF value")
+axs[0,0].legend(); axs[0,0].grid(alpha=.3)
+
+axs[0,1].plot(t, safe("margin_acc"), lw=2, label="margin")
+axs[0,1].axhline(0, ls="--", color="r")
+axs[0,1].set_ylabel("margin"); axs[0,1].set_title("ACC CBF margin (≥0 req.)")
+axs[0,1].legend(); axs[0,1].grid(alpha=.3)
+
+# Row 1: Lane / target CBF
+axs[1,0].plot(t, safe("h_lane"), lw=2, label="h_lane")
+axs[1,0].axhline(0, ls="--", color="r")
+axs[1,0].set_ylabel("h_lane"); axs[1,0].set_title("Target-ellipse CBF value")
+axs[1,0].legend(); axs[1,0].grid(alpha=.3)
+
+lane_margin = (safe("LfH_lane") + safe("LgHu_lane")
+               + params["cbf_k_lane"] * safe("h_lane"))
+axs[1,1].plot(t, lane_margin, lw=2, label="margin")
+axs[1,1].axhline(0, ls="--", color="r")
+axs[1,1].set_ylabel("margin"); axs[1,1].set_title("Target-ellipse CBF margin")
+axs[1,1].legend(); axs[1,1].grid(alpha=.3)
+
+# Row 2: Stochastic sigma
+axs[2,0].plot(t, safe("sig_acc"),  lw=2, label="σ_acc")
+axs[2,0].plot(t, safe("sig_lane"), lw=2, label="σ_lane", ls="--")
+axs[2,0].set_ylabel("σ"); axs[2,0].set_title("Stochastic correction σ")
+axs[2,0].legend(); axs[2,0].grid(alpha=.3)
+
+axs[2,1].plot(t, safe("risk_upper_bound"), lw=2, color="orange", label="p̄_B")
+axs[2,1].axhline(params["p_bar"], ls="--", color="r",
+                 label=f"p_bar={params['p_bar']}")
+axs[2,1].set_ylabel("risk"); axs[2,1].set_title("Risk upper bound p̄_B (≤ p_bar req.)")
+axs[2,1].legend(); axs[2,1].grid(alpha=.3)
+
+# Row 3: b parameters vs their bounds
+axs[3,0].plot(t, safe("b_acc"),     lw=2, label="b_acc (solved)")
+axs[3,0].plot(t, safe("b_max_acc"), lw=1, ls="--", label="b_max_acc (Thm 2)")
+axs[3,0].set_ylabel("b"); axs[3,0].set_title("SCBF b_acc  (paper Thm 2 cond. 14)")
+axs[3,0].legend(); axs[3,0].grid(alpha=.3)
+
+axs[3,1].plot(t, safe("b_lane"),     lw=2, label="b_lane (solved)")
+axs[3,1].plot(t, safe("b_max_lane"), lw=1, ls="--", label="b_max_lane (Thm 2)")
+axs[3,1].set_ylabel("b"); axs[3,1].set_title("SCBF b_lane  (paper Thm 2 cond. 14)")
+axs[3,1].legend(); axs[3,1].grid(alpha=.3)
+
+# Row 4: Ego state
+axs[4,0].plot(t, safe("v"), lw=2, label="v")
+axs[4,0].axhline(params["v_d"], ls="--", color="g",
+                 label=f"v_d={params['v_d']}")
+axs[4,0].set_xlabel("Time (s)"); axs[4,0].set_ylabel("m/s")
+axs[4,0].set_title("Ego speed"); axs[4,0].legend(); axs[4,0].grid(alpha=.3)
+
+axs[4,1].plot(t, safe("y"), lw=2, label="y (lateral)")
+axs[4,1].set_xlabel("Time (s)"); axs[4,1].set_ylabel("m")
+axs[4,1].set_title("Ego lateral position"); axs[4,1].legend(); axs[4,1].grid(alpha=.3)
+
+plt.tight_layout()
+plt.savefig("scbf_results.png", dpi=120)
+plt.show()
